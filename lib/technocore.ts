@@ -65,13 +65,13 @@ export async function getRoomHealth(
       exists = true;
       const data = await res.json();
       if (Array.isArray(data.messages)) {
-        messages = data.messages.map((m: any, idx: number) => ({
-          seq: m.seq || idx + 1,
-          ts: m.ts || m.time || new Date().toISOString(),
-          sender: m.from || m.sender || m.nick || "unknown",
-          text: m.text || m.body || "",
-          sig: m.sig,
-          nonce: m.nonce,
+        messages = (data.messages as Array<Record<string, unknown>>).map((m, idx: number) => ({
+          seq: typeof m.seq === "number" ? m.seq : idx + 1,
+          ts: (typeof m.ts === "string" ? m.ts : typeof m.time === "string" ? m.time : new Date().toISOString()),
+          sender: (typeof m.from === "string" ? m.from : typeof m.sender === "string" ? m.sender : typeof m.nick === "string" ? m.nick : "unknown"),
+          text: (typeof m.text === "string" ? m.text : typeof m.body === "string" ? m.body : ""),
+          sig: typeof m.sig === "string" ? m.sig : undefined,
+          nonce: typeof m.nonce === "number" ? m.nonce : undefined,
         }));
         totalMessages = messages.length;
         if (messages.length > 0) {
@@ -81,7 +81,7 @@ export async function getRoomHealth(
     } else if (res.status === 404) {
       exists = false;
     }
-  } catch (err) {
+  } catch {
     // Fallback: fetch plain text view if json fails
     try {
       const textRes = await fetch(`${serverUrl}/r/${cleanRoom}`, {

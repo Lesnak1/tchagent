@@ -39,9 +39,10 @@ export async function POST(request: NextRequest) {
       preHealth: result.preCycleHealth,
       postHealth: result.postCycleHealth,
     });
-  } catch (error: any) {
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : "Manual trigger execution failed";
     return NextResponse.json(
-      { error: error.message || "Manual trigger execution failed" },
+      { error: message },
       { status: 500 }
     );
   }

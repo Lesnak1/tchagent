@@ -51,11 +51,12 @@ export async function GET(request: NextRequest) {
         { status: 502 }
       );
     }
-  } catch (error: any) {
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : "Unknown error during autonomous cycle";
     return NextResponse.json(
       {
         status: "error",
-        error: error.message || "Unknown error during autonomous cycle",
+        error: message,
       },
       { status: 500 }
     );

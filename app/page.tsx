@@ -55,18 +55,19 @@ export default function Home() {
   const [copiedCmd, setCopiedCmd] = useState(false);
 
   // Manual Trigger state
-  const [adminKey, setAdminKey] = useState("");
+  const [adminKey, setAdminKey] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      try {
+        return localStorage.getItem("technocore_admin_key") || "";
+      } catch {
+        return "";
+      }
+    }
+    return "";
+  });
   const [triggering, setTriggering] = useState(false);
   const [triggerResult, setTriggerResult] = useState<TriggerResult | null>(null);
   const [triggerError, setTriggerError] = useState<string | null>(null);
-
-  // Load saved admin key from localStorage if available
-  useEffect(() => {
-    if (typeof window !== "undefined") {
-      const savedKey = localStorage.getItem("technocore_admin_key");
-      if (savedKey) setAdminKey(savedKey);
-    }
-  }, []);
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -78,17 +79,27 @@ export default function Home() {
       }
       const json: StatusResponse = await res.json();
       setData(json);
-    } catch (err: any) {
-      setError(err.message || "Failed to connect to agent server");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Failed to connect to agent server";
+      setError(message);
     } finally {
       setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    fetchStatus();
-    const interval = setInterval(fetchStatus, 30000); // refresh every 30s
-    return () => clearInterval(interval);
+    const timer = setTimeout(() => {
+      void fetchStatus();
+    }, 0);
+
+    const interval = setInterval(() => {
+      void fetchStatus();
+    }, 30000); // refresh every 30s
+
+    return () => {
+      clearTimeout(timer);
+      clearInterval(interval);
+    };
   }, [fetchStatus]);
 
   const handleCopyDid = (did: string) => {
@@ -132,8 +143,9 @@ export default function Home() {
       setTriggerResult(json);
       // Re-fetch room status to update messages & reap countdown
       await fetchStatus();
-    } catch (err: any) {
-      setTriggerError(err.message || "Keepalive execution failed");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Keepalive execution failed";
+      setTriggerError(message);
     } finally {
       setTriggering(false);
     }

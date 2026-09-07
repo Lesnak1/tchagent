@@ -33,11 +33,12 @@ export async function GET() {
       health,
       timestamp: new Date().toISOString(),
     });
-  } catch (error: any) {
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : "Failed to query room status";
     return NextResponse.json(
       {
         status: "error",
-        error: error.message || "Failed to query room status",
+        error: message,
       },
       { status: 500 }
     );
