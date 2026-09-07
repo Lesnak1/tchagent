@@ -1,0 +1,41 @@
+name: Technocore Autonomous Keepalive (Fallback Cron)
+
+on:
+  schedule:
+    # Runs at 12:00 UTC on Mondays and Thursdays (every 3-4 days)
+    - cron: '0 12 * * 1,4'
+  workflow_dispatch: # Allows manual trigger from GitHub Actions UI
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Execute Autonomous Keepalive Cycle
+        env:
+          AGENT_SEED: ${{ secrets.AGENT_SEED }}
+          ROOM_NAME: ${{ secrets.ROOM_NAME || 'd-lesnak1' }}
+          TECHNOCORE_URL: ${{ vars.TECHNOCORE_URL || 'https://technocore.chat' }}
+        run: |
+          node -e "
+            const { runAutonomousKeepaliveCycle } = require('./lib/technocore');
+            runAutonomousKeepaliveCycle(process.env.AGENT_SEED, process.env.ROOM_NAME)
+              .then(res => {
+                console.log('Keepalive Result:', res.success ? 'SUCCESS' : 'FAILURE');
+                if (!res.success) process.exit(1);
+              })
+              .catch(err => {
+                console.error(err);
+                process.exit(1);
+              });
+          " || echo "Node script completed."
