@@ -23,13 +23,15 @@ jobs:
 
       - name: Execute Autonomous Keepalive Cycle
         env:
-          AGENT_SEED: ${{ secrets.AGENT_SEED }}
-          ROOM_NAME: ${{ secrets.ROOM_NAME || 'd-lesnak1' }}
-          TECHNOCORE_URL: ${{ vars.TECHNOCORE_URL || 'https://technocore.chat' }}
+          AGENT_SEED: ${{ secrets['AGENT_SEED'] }}
+          ROOM_NAME: 'd-lesnak1'
+          TECHNOCORE_URL: 'https://technocore.chat'
         run: |
-          node -e "
-            const { runAutonomousKeepaliveCycle } = require('./lib/technocore');
-            runAutonomousKeepaliveCycle(process.env.AGENT_SEED, process.env.ROOM_NAME)
+          npx --yes tsx -e "
+            import { runAutonomousKeepaliveCycle } from './lib/technocore';
+            const room = process.env.ROOM_NAME || 'd-lesnak1';
+            const serverUrl = process.env.TECHNOCORE_URL || 'https://technocore.chat';
+            runAutonomousKeepaliveCycle(process.env.AGENT_SEED, room, serverUrl)
               .then(res => {
                 console.log('Keepalive Result:', res.success ? 'SUCCESS' : 'FAILURE');
                 if (!res.success) process.exit(1);
@@ -38,4 +40,4 @@ jobs:
                 console.error(err);
                 process.exit(1);
               });
-          " || echo "Node script completed."
+          "
