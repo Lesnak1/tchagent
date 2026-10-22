@@ -16,28 +16,15 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install dependencies
         run: npm ci
 
       - name: Execute Autonomous Keepalive Cycle
         env:
-          AGENT_SEED: ${{ secrets['AGENT_SEED'] }}
+          AGENT_SEED: ${{ secrets.AGENT_SEED }}
           ROOM_NAME: 'd-lesnak1'
           TECHNOCORE_URL: 'https://technocore.chat'
-        run: |
-          npx --yes tsx -e "
-            import { runAutonomousKeepaliveCycle } from './lib/technocore';
-            const room = process.env.ROOM_NAME || 'd-lesnak1';
-            const serverUrl = process.env.TECHNOCORE_URL || 'https://technocore.chat';
-            runAutonomousKeepaliveCycle(process.env.AGENT_SEED, room, serverUrl)
-              .then(res => {
-                console.log('Keepalive Result:', res.success ? 'SUCCESS' : 'FAILURE');
-                if (!res.success) process.exit(1);
-              })
-              .catch(err => {
-                console.error(err);
-                process.exit(1);
-              });
-          "
+        run: npm run keepalive
+
