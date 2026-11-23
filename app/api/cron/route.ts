@@ -39,6 +39,7 @@ export async function GET(request: NextRequest) {
         payerDid: result.payerDid,
         technocoreStatus: result.technocoreStatus,
         hoursUntilReap: result.postCycleHealth?.hoursUntilReap ?? 168,
+        identitySync: result.identitySync,
       });
     } else {
       return NextResponse.json(

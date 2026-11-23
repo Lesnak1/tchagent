@@ -36,6 +36,7 @@ export async function POST(request: NextRequest) {
       responseText: result.responseText,
       timestamp: result.timestamp,
       nonce: result.nonce,
+      identitySync: result.identitySync,
       preHealth: result.preCycleHealth,
       postHealth: result.postCycleHealth,
     });

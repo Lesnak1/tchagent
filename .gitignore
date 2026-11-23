@@ -46,3 +46,6 @@ next-env.d.ts
 *.pyc
 __pycache__/
 
+# local flop agent runtime state (cooldowns, pending funding reconciliation)
+.flop-agent-state.json
+
