@@ -15,7 +15,7 @@
   },
   "dependencies": {
     "@flop-labs/client": "^0.2.2",
-    "@flop-labs/sdk": "^0.9.0",
+    "@flop-labs/sdk": "^0.10.0",
     "@noble/curves": "^2.4.0",
     "next": "16.3.4",
     "react": "19.2.8",

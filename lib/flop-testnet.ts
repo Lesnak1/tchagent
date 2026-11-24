@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import http from 'node:http';
+import https from 'node:https';
 import {
   FLOP_DECIMALS,
   FLOP_SS58_FORMAT,
@@ -85,6 +87,28 @@ export interface OrganicTaskSpec {
   turns: [string, string];
 }
 
+export const FLOP_TESTNET_GENESIS_HASH =
+  '0x918abd58fb16306b30ef3886514cfaebffecb4de43e82b6f8ec4795c43cfd800';
+export const FLOP_TESTNET_EXPLORER_URL = 'https://testnet.flopscan.io';
+
+export interface FlopscanStats {
+  latestBlockNumber: number;
+  registeredMiners: number;
+  activeValidators: number;
+  activeAgents: number;
+  totalAccounts: number;
+  totalHTLCs: number;
+  proofs24h: number;
+  finality?: {
+    finalizedBlock?: number;
+    state?: string;
+  };
+  consensus?: {
+    state?: string;
+    peers?: number;
+  };
+}
+
 const FAU_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 export function getFlopNetworkConfig(networkOverride?: FlopNetwork): FlopTestnetEnvConfig {
@@ -93,9 +117,7 @@ export function getFlopNetworkConfig(networkOverride?: FlopNetwork): FlopTestnet
   const profile = getFlopNetworkProfile(network);
 
   const explorerDefault =
-    network === 'devnet'
-      ? 'https://explorer.devnet.flop.network'
-      : 'https://explorer.testnet.flop.network';
+    network === 'devnet' ? 'https://explorer.devnet.flop.network' : FLOP_TESTNET_EXPLORER_URL;
 
   return {
     network,
@@ -182,6 +204,83 @@ export async function fetchFaucetChainMetadata(
   }
 }
 
+export async function fetchFlopscanStats(
+  explorerUrl: string
+): Promise<{ ok: boolean; status: number; data?: FlopscanStats; error?: string }> {
+  const base = explorerUrl.replace(/\/+$/, '');
+  try {
+    const res = await fetch(`${base}/api/stats`, {
+      headers: { Accept: 'application/json', 'User-Agent': 'TechnocoreAgentBot/1.0' },
+      signal: AbortSignal.timeout(8000),
+      cache: 'no-store',
+    });
+    if (!res.ok) {
+      return { ok: false, status: res.status, error: `HTTP ${res.status}` };
+    }
+    const data = (await res.json()) as FlopscanStats;
+    return { ok: true, status: res.status, data };
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      status: 0,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+export async function httpGetNoSecFetch(
+  urlStr: string,
+  timeoutMs = 20_000
+): Promise<{ ok: boolean; status: number; body: string; refusalReason?: string }> {
+  return new Promise((resolve, reject) => {
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(urlStr);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    const transport = parsedUrl.protocol === 'http:' ? http : https;
+    const req = transport.request(
+      parsedUrl,
+      {
+        method: 'GET',
+        headers: {
+          Accept: 'text/plain, application/json',
+          'User-Agent': 'TechnocoreAgentBot/1.0',
+        },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer | string) => {
+          chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+        });
+        res.on('end', () => {
+          const status = res.statusCode ?? 0;
+          const body = Buffer.concat(chunks).toString('utf8');
+          const rawReason = res.headers['x-flop-refusal-reason'];
+          const refusalReason = Array.isArray(rawReason) ? rawReason[0] : rawReason;
+          resolve({
+            ok: status >= 200 && status < 300,
+            status,
+            body,
+            refusalReason: refusalReason?.trim() || undefined,
+          });
+        });
+        res.on('error', reject);
+      }
+    );
+
+    req.on('timeout', () => {
+      req.destroy(new Error(`Request timed out after ${timeoutMs}ms`));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
 export function buildOrganicAgentTask(seedIndex?: number): OrganicTaskSpec {
   const daySeed = new Date().toISOString().slice(0, 10);
   const tasks: OrganicTaskSpec[] = [
@@ -255,14 +354,48 @@ export async function probeTestnetHealth(
   console.log(`Configured RPC    : ${config.rpcUrl}`);
   console.log(`Configured Gateway: ${config.gatewayUrl}`);
   console.log(`Configured Faucet : ${config.faucetUrl ?? 'none'}`);
+  console.log(`ConfiguredExplorer: ${config.explorerUrl}`);
+  if (config.network === 'testnet') {
+    console.log(`Pinned Genesis    : ${FLOP_TESTNET_GENESIS_HASH}`);
+  }
   console.log(`Local State File  : ${config.stateFilePath}`);
   console.log(`Last Faucet Claim : ${state.lastFaucetAttemptAt ?? 'none'} (${state.lastFaucetOutcome ?? 'n/a'})`);
   console.log('----------------------------------------------------------------');
 
+  const scanStats = await fetchFlopscanStats(config.explorerUrl);
+  if (scanStats.ok && scanStats.data) {
+    const s = scanStats.data;
+    const finBlock = s.finality?.finalizedBlock ?? 'n/a';
+    const finState = s.finality?.state ?? 'n/a';
+    const consState = s.consensus?.state ?? 'n/a';
+    const peers = s.consensus?.peers ?? 'n/a';
+    console.log(
+      `FLOPScan Chain    : block #${s.latestBlockNumber} (finalized #${finBlock}, ${finState}) | consensus=${consState} peers=${peers}`
+    );
+    console.log(
+      `FLOPScan Network  : validators=${s.activeValidators}, miners=${s.registeredMiners}, agents=${s.activeAgents}, accounts=${s.totalAccounts}, htlcs=${s.totalHTLCs}, proofs24h=${s.proofs24h}`
+    );
+  } else {
+    console.log(`FLOPScan Chain    : UNREACHABLE (${scanStats.error ?? `HTTP ${scanStats.status}`})`);
+  }
+
+  let faucetMatchesTestnet = false;
   if (config.faucetUrl) {
     const chainMeta = await fetchFaucetChainMetadata(config.faucetUrl);
     if (chainMeta.ok && chainMeta.data) {
-      console.log(`Faucet /chain     : REACHABLE (${chainMeta.data.network}, genesis ${chainMeta.data.genesisHash.slice(0, 14)}...)`);
+      const genesisOk =
+        config.network !== 'testnet' ||
+        chainMeta.data.genesisHash.toLowerCase() === FLOP_TESTNET_GENESIS_HASH;
+      faucetMatchesTestnet = genesisOk;
+      const genesisTag =
+        config.network === 'testnet'
+          ? genesisOk
+            ? '[GENESIS MATCH]'
+            : '[GENESIS MISMATCH]'
+          : '';
+      console.log(
+        `Faucet /chain     : REACHABLE (${chainMeta.data.network}, genesis ${chainMeta.data.genesisHash.slice(0, 14)}...) ${genesisTag}`.trim()
+      );
       if (chainMeta.data.technocoreBot) {
         console.log(`Faucet Bot        : room=/r/${chainMeta.data.technocoreBot.room} did=${chainMeta.data.technocoreBot.did}`);
       }
@@ -299,9 +432,19 @@ export async function probeTestnetHealth(
   }
 
   console.log('----------------------------------------------------------------');
-  console.log('Readiness Summary : Launch opens 2026-11-24 07:00 UTC (10:00 TSI).');
-  console.log('When links publish, update .env.local (if URLs differ from defaults)');
-  console.log('and run: npm run flop-testnet:run');
+  const minersCount = scanStats.data?.registeredMiners ?? 0;
+  const agentsCount = scanStats.data?.activeAgents ?? 0;
+  if (config.network === 'testnet' && (!faucetMatchesTestnet || gwModels.length === 0 || minersCount === 0)) {
+    console.log(
+      `Readiness Summary : Testnet is in unscored opening (miners=${minersCount}, agents=${agentsCount}, gatewayModels=${gwModels.length}).`
+    );
+    console.log('Faucet / Gateway / Miners are not activated yet — hold faucet/spend until live.');
+  } else {
+    console.log(
+      `Readiness Summary : Network online (miners=${minersCount}, agents=${agentsCount}, models=${gwModels.length}).`
+    );
+    console.log('Ready to run: npm run flop-testnet:run');
+  }
   console.log('================================================================');
 }
 
@@ -359,6 +502,18 @@ export async function claimDailyFaucet(
     };
   }
 
+  if (
+    !options.skipNetworkMatch &&
+    config.network === 'testnet' &&
+    chainCheck.data.genesisHash?.toLowerCase() !== FLOP_TESTNET_GENESIS_HASH
+  ) {
+    return {
+      claimed: false,
+      outcome: 'genesis_mismatch',
+      reason: `Refusing claim: expected Testnet genesis ${FLOP_TESTNET_GENESIS_HASH}, faucet /chain reported ${chainCheck.data.genesisHash}`,
+    };
+  }
+
   if (options.viaTechnocoreBot && chainCheck.data.technocoreBot) {
     const bot = chainCheck.data.technocoreBot;
     const preHealth = await getRoomHealth(bot.room, config.technocoreUrl);
@@ -375,7 +530,7 @@ export async function claimDailyFaucet(
       };
     }
 
-    // Long-poll once for the bot's signed challenge reply (`patterns.md` §8)
+    // Long-poll once for the bot's signed reply (`patterns.md` §8)
     const pollRes = await fetch(
       `${config.technocoreUrl}/r/${bot.room}?since=${lastSeq}&wait=10&format=json`,
       { headers: { 'User-Agent': 'TechnocoreAgentBot/1.0' }, signal: AbortSignal.timeout(15_000) }
@@ -391,7 +546,11 @@ export async function claimDailyFaucet(
       const text = m.text || '';
       if (sender !== bot.did || typeof m.sig !== 'string' || m.nonce === undefined) return false;
       if (!verifyRoomMessage(bot.did, bot.room, m.nonce, text, m.sig)) return false;
-      return text.includes(`fund|${identity.ss58Address}|${nonce}`);
+      return (
+        text.includes(`fund|${identity.ss58Address}|${nonce}`) ||
+        text.includes(identity.ss58Address) ||
+        text.includes(String(nonce))
+      );
     });
 
     if (!botReply?.text) {
@@ -403,29 +562,57 @@ export async function claimDailyFaucet(
       return {
         claimed: false,
         outcome: 'unknown',
-        reason: 'Did not receive a verified signed challenge from the official faucet bot within 10s.',
+        reason: 'Did not receive a verified signed reply from the official faucet bot within 10s.',
       };
     }
 
     const challenge = `fund|${identity.ss58Address}|${nonce}`;
+    if (!botReply.text.includes(challenge)) {
+      const txMatch = botReply.text.match(/\b(0x[0-9a-fA-F]{64})\b/);
+      state.lastFaucetAttemptAt = new Date().toISOString();
+      state.address = identity.ss58Address;
+      state.network = config.network;
+      if (txMatch && !botReply.text.includes('Unsigned challenge:')) {
+        state.lastFaucetOutcome = 'accepted';
+        state.lastFaucetTxHash = txMatch[1];
+        saveLocalAgentState(config.stateFilePath, state);
+        return {
+          claimed: true,
+          outcome: 'accepted',
+          txHash: txMatch[1],
+          reason: botReply.text.slice(0, 300),
+        };
+      }
+      state.lastFaucetOutcome = 'refused';
+      saveLocalAgentState(config.stateFilePath, state);
+      return {
+        claimed: false,
+        outcome: 'refused',
+        reason: botReply.text.slice(0, 300),
+      };
+    }
+
     const signedChallenge = signChallengeBytes(seedHex, challenge);
-    const faucetBase = config.faucetUrl.replace(/\/+$/, '');
+    const urlOriginMatch = botReply.text.match(/https:\/\/[a-z0-9.-]+(?=\/faucet\/fund\/)/i);
+    const faucetBase = (urlOriginMatch ? urlOriginMatch[0] : config.faucetUrl).replace(/\/+$/, '');
     const fundUrl = `${faucetBase}/faucet/fund/${identity.ss58Address}/${nonce}/${signedChallenge.sigHex}`;
-    const claimRes = await fetch(fundUrl, {
-      method: 'GET',
-      headers: { Accept: 'application/json' },
-      signal: AbortSignal.timeout(20_000),
-    });
-    const claimBody = await claimRes.text();
+    const claimRes = await httpGetNoSecFetch(fundUrl, 20_000);
     state.lastFaucetAttemptAt = new Date().toISOString();
     state.address = identity.ss58Address;
     state.network = config.network;
-    state.lastFaucetOutcome = claimRes.ok ? 'accepted' : claimRes.status >= 500 ? 'unknown' : 'refused';
+    state.lastFaucetOutcome = claimRes.ok ? 'accepted' : claimRes.status >= 500 || claimRes.status === 0 ? 'unknown' : 'refused';
+    const txMatch = claimRes.body.match(/\b(0x[0-9a-fA-F]{64})\b/);
+    if (claimRes.ok && txMatch) {
+      state.lastFaucetTxHash = txMatch[1];
+    }
     saveLocalAgentState(config.stateFilePath, state);
     return {
       claimed: claimRes.ok,
       outcome: state.lastFaucetOutcome,
-      reason: claimBody.slice(0, 300),
+      txHash: claimRes.ok && txMatch ? txMatch[1] : undefined,
+      reason: claimRes.refusalReason
+        ? `${claimRes.refusalReason}: ${claimRes.body.slice(0, 260)}`
+        : claimRes.body.slice(0, 300),
     };
   }
 

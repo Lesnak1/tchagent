@@ -87,7 +87,13 @@ export async function getLiveFlopModels(baseUrl: string = FLOP_DEVNET_CONFIG.gat
       };
     });
   } catch (err) {
-    console.error('Error contacting Flop Network Gateway:', err);
+    const detail =
+      err instanceof Error
+        ? err.cause instanceof Error
+          ? err.cause.message
+          : err.message
+        : String(err);
+    console.warn(`[flop] Gateway unreachable (${baseUrl}): ${detail}`);
     return [];
   }
 }
