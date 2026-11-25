@@ -4,12 +4,14 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 import {
+  D10_FAUCET_GENESIS_HASH,
   FLOP_DECIMALS,
   FLOP_SS58_FORMAT,
   FlopClient as FlopChainClient,
   type FlopNetwork,
   type InferencePurchaseIntent,
   type InferenceReceipt,
+  claimTestnetAgentFunds,
   formatFlop,
   getFlopNetworkProfile,
   isFlopNetwork,
@@ -61,6 +63,8 @@ export interface LocalAgentState {
   lastFaucetAttemptAt?: string;
   lastFaucetOutcome?: string;
   lastFaucetTxHash?: string;
+  lastFaucetNonce?: string;
+  lastFaucetTransferStatus?: string;
   lastSpendAt?: string;
   pendingPurchaseIntents?: Record<string, InferencePurchaseIntent>;
   completedSessions?: Array<{
@@ -72,6 +76,28 @@ export interface LocalAgentState {
     gnUsed?: string;
     txOrReceiptId?: string;
   }>;
+}
+
+export interface FaucetLimitsMetadata {
+  network: string;
+  faucet?: {
+    status?: string;
+    signer?: string;
+    minBalanceFlop?: string;
+    dailyCap?: {
+      limitFlop?: string;
+      usedFlop?: string;
+      remainingFlop?: string;
+    };
+    pendingGrants?: number;
+    agent?: {
+      grantFlop?: number;
+      claimPath?: string;
+      rolling24HourCapFlop?: number;
+      cooldownSeconds?: number;
+      rolloverRequiresSpend?: boolean;
+    };
+  };
 }
 
 export interface DerivedSubstrateIdentity {
@@ -87,8 +113,7 @@ export interface OrganicTaskSpec {
   turns: [string, string];
 }
 
-export const FLOP_TESTNET_GENESIS_HASH =
-  '0x918abd58fb16306b30ef3886514cfaebffecb4de43e82b6f8ec4795c43cfd800';
+export const FLOP_TESTNET_GENESIS_HASH = D10_FAUCET_GENESIS_HASH;
 export const FLOP_TESTNET_EXPLORER_URL = 'https://testnet.flopscan.io';
 
 export interface FlopscanStats {
@@ -122,7 +147,7 @@ export function getFlopNetworkConfig(networkOverride?: FlopNetwork): FlopTestnet
   return {
     network,
     rpcUrl: (process.env.FLOP_RPC_URL || profile.rpc).trim(),
-    gatewayUrl: (process.env.FLOP_GATEWAY_URL || profile.gateway).trim(),
+    gatewayUrl: (process.env.FLOP_GATEWAY_URL || profile.gateway || '').trim(),
     faucetUrl:
       process.env.FLOP_FAUCET_URL !== undefined
         ? process.env.FLOP_FAUCET_URL.trim() || null
@@ -194,6 +219,30 @@ export async function fetchFaucetChainMetadata(
       return { ok: false, status: res.status, error: `HTTP ${res.status}` };
     }
     const data = (await res.json()) as FaucetChainMetadata;
+    return { ok: true, status: res.status, data };
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      status: 0,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+export async function fetchFaucetLimits(
+  faucetUrl: string
+): Promise<{ ok: boolean; status: number; data?: FaucetLimitsMetadata; error?: string }> {
+  const base = faucetUrl.replace(/\/+$/, '');
+  try {
+    const res = await fetch(`${base}/limits`, {
+      headers: { Accept: 'application/json', 'User-Agent': 'TechnocoreAgentBot/1.0' },
+      signal: AbortSignal.timeout(8000),
+      cache: 'no-store',
+    });
+    if (!res.ok) {
+      return { ok: false, status: res.status, error: `HTTP ${res.status}` };
+    }
+    const data = (await res.json()) as FaucetLimitsMetadata;
     return { ok: true, status: res.status, data };
   } catch (err: unknown) {
     return {
@@ -352,7 +401,7 @@ export async function probeTestnetHealth(
   console.log(`Technocore Room   : /r/${roomHealth.room} (${roomHealth.exists ? 'LIVE' : 'MISSING'}, ${roomHealth.totalMessages} msgs, reap in ${roomHealth.hoursUntilReap}h)`);
   console.log(`DID Note KV       : ${roomHealth.didNotePath ?? 'n/a'} (${roomHealth.didNoteExists ? 'HTTP 200 OK' : 'MISSING'})`);
   console.log(`Configured RPC    : ${config.rpcUrl}`);
-  console.log(`Configured Gateway: ${config.gatewayUrl}`);
+  console.log(`Configured Gateway: ${config.gatewayUrl || 'none'}`);
   console.log(`Configured Faucet : ${config.faucetUrl ?? 'none'}`);
   console.log(`ConfiguredExplorer: ${config.explorerUrl}`);
   if (config.network === 'testnet') {
@@ -381,7 +430,10 @@ export async function probeTestnetHealth(
 
   let faucetMatchesTestnet = false;
   if (config.faucetUrl) {
-    const chainMeta = await fetchFaucetChainMetadata(config.faucetUrl);
+    const [chainMeta, limitsRes] = await Promise.all([
+      fetchFaucetChainMetadata(config.faucetUrl),
+      fetchFaucetLimits(config.faucetUrl),
+    ]);
     if (chainMeta.ok && chainMeta.data) {
       const genesisOk =
         config.network !== 'testnet' ||
@@ -402,22 +454,37 @@ export async function probeTestnetHealth(
     } else {
       console.log(`Faucet /chain     : NOT LIVE YET (${chainMeta.error ?? `HTTP ${chainMeta.status}`})`);
     }
+    if (limitsRes.ok && limitsRes.data?.faucet) {
+      const f = limitsRes.data.faucet;
+      if (f.agent) {
+        console.log(
+          `Faucet Agent Tier : grant=${f.agent.grantFlop ?? 'n/a'} FLOP, path=${f.agent.claimPath ?? 'n/a'}, rolloverRequiresSpend=${String(f.agent.rolloverRequiresSpend ?? 'n/a')}`
+        );
+      }
+      if (f.dailyCap) {
+        console.log(
+          `Faucet Daily Cap  : remaining=${f.dailyCap.remainingFlop ?? 'n/a'} / ${f.dailyCap.limitFlop ?? 'n/a'} FLOP (pending=${f.pendingGrants ?? 0})`
+        );
+      }
+    }
   }
 
-  const gwModels = await getLiveFlopModels(config.gatewayUrl);
+  const gwModels = config.gatewayUrl ? await getLiveFlopModels(config.gatewayUrl) : [];
   console.log(`Gateway /v1/models: ${gwModels.length > 0 ? `ONLINE (${gwModels.length} models)` : 'NOT LIVE YET / UNREACHABLE'}`);
 
   if (options.allowDevnetProbe && config.network !== 'devnet') {
     const devnet = getFlopNetworkProfile('devnet');
     const devChain = devnet.faucet ? await fetchFaucetChainMetadata(devnet.faucet) : { ok: false, status: 0 };
-    const devModels = await getLiveFlopModels(devnet.gateway);
+    const devModels = devnet.gateway ? await getLiveFlopModels(devnet.gateway) : [];
     console.log('----------------------------------------------------------------');
     console.log(`Devnet Baseline   : faucet=${devChain.ok ? `OK (${devChain.data?.technocoreBot?.room ?? 'no-bot'})` : 'ERR'}, models=${devModels.length}`);
   }
 
   // Check on-chain RPC connectivity & balance when live
   try {
-    const chainClient = await FlopChainClient.createWithKeypair(config.rpcUrl, identity.pair);
+    const chainClient = await FlopChainClient.createWithKeypair(config.rpcUrl, identity.pair, {
+      expectedGenesisHash: config.network === 'testnet' ? D10_FAUCET_GENESIS_HASH : undefined,
+    });
     try {
       const info = await chainClient.getAccountInfo(identity.ss58Address);
       const health = await chainClient.health();
@@ -434,11 +501,16 @@ export async function probeTestnetHealth(
   console.log('----------------------------------------------------------------');
   const minersCount = scanStats.data?.registeredMiners ?? 0;
   const agentsCount = scanStats.data?.activeAgents ?? 0;
-  if (config.network === 'testnet' && (!faucetMatchesTestnet || gwModels.length === 0 || minersCount === 0)) {
+  if (config.network === 'testnet' && !faucetMatchesTestnet) {
     console.log(
-      `Readiness Summary : Testnet is in unscored opening (miners=${minersCount}, agents=${agentsCount}, gatewayModels=${gwModels.length}).`
+      `Readiness Summary : Testnet faucet not live/matched yet (miners=${minersCount}, agents=${agentsCount}, gatewayModels=${gwModels.length}).`
     );
-    console.log('Faucet / Gateway / Miners are not activated yet — hold faucet/spend until live.');
+    console.log('Hold faucet/spend until Faucet /chain reports [GENESIS MATCH].');
+  } else if (config.network === 'testnet' && (gwModels.length === 0 || minersCount === 0)) {
+    console.log(
+      `Readiness Summary : Testnet faucet is LIVE ([GENESIS MATCH]), unscored opening (miners=${minersCount}, agents=${agentsCount}, gatewayModels=${gwModels.length}).`
+    );
+    console.log('Safe for single-shot: npm run flop-testnet:faucet | Hold --spend until miners & voucher start block activate.');
   } else {
     console.log(
       `Readiness Summary : Network online (miners=${minersCount}, agents=${agentsCount}, models=${gwModels.length}).`
@@ -456,7 +528,14 @@ export async function claimDailyFaucet(
   seedHex: string,
   config: FlopTestnetEnvConfig,
   options: { viaTechnocoreBot?: boolean; skipNetworkMatch?: boolean } = {}
-): Promise<{ claimed: boolean; outcome: string; txHash?: string; reason?: string }> {
+): Promise<{
+  claimed: boolean;
+  outcome: string;
+  txHash?: string;
+  reason?: string;
+  nonce?: string;
+  transferStatus?: string;
+}> {
   if (!config.faucetUrl) {
     return { claimed: false, outcome: 'unavailable', reason: 'No FLOP_FAUCET_URL configured' };
   }
@@ -616,7 +695,32 @@ export async function claimDailyFaucet(
     };
   }
 
-  // Standard SDK single-shot POST /fund (never retries blindly)
+  if (config.network === 'testnet') {
+    const res = await claimTestnetAgentFunds(identity.ss58Address, {
+      endpoint: config.faucetUrl,
+      sign: (message: Uint8Array) => identity.pair.sign(message),
+    });
+
+    state.address = identity.ss58Address;
+    state.network = config.network;
+    state.lastFaucetAttemptAt = res.timestamp;
+    state.lastFaucetOutcome = res.outcome ?? (res.success ? 'accepted' : 'unknown');
+    state.lastFaucetNonce = res.nonce;
+    if (res.txHash) state.lastFaucetTxHash = res.txHash;
+    if (res.transferStatus) state.lastFaucetTransferStatus = res.transferStatus;
+    saveLocalAgentState(config.stateFilePath, state);
+
+    return {
+      claimed: res.success,
+      outcome: state.lastFaucetOutcome,
+      txHash: res.txHash,
+      reason: res.error ?? res.reason,
+      nonce: res.nonce,
+      transferStatus: res.transferStatus,
+    };
+  }
+
+  // Standard SDK single-shot POST /fund (never retries blindly; devnet/local)
   const res = await requestFaucetFunding(identity.ss58Address, {
     network: config.network,
     endpoint: config.faucetUrl,
@@ -648,7 +752,7 @@ export async function spendTestnetCompute(
   options: { escrowFlop?: number; modelId?: string } = {}
 ): Promise<{ spent: boolean; rail: string; details: Record<string, unknown> }> {
   const identity = await deriveAgentSubstrateIdentity(seedHex, config.substrateUri);
-  const models: FlopModelInfo[] = await getLiveFlopModels(config.gatewayUrl);
+  const models: FlopModelInfo[] = config.gatewayUrl ? await getLiveFlopModels(config.gatewayUrl) : [];
   const candidateModel =
     (options.modelId ? models.find((m) => m.id === options.modelId) : undefined) ||
     models.find((m) => m.activeMinersCount > 0) ||
@@ -659,7 +763,9 @@ export async function spendTestnetCompute(
 
   // Path 1: On-chain direct compute-channel session (`pallet_compute_channel`)
   if (config.minerUrl) {
-    const chainClient = await FlopChainClient.createWithKeypair(config.rpcUrl, identity.pair);
+    const chainClient = await FlopChainClient.createWithKeypair(config.rpcUrl, identity.pair, {
+      expectedGenesisHash: config.network === 'testnet' ? D10_FAUCET_GENESIS_HASH : undefined,
+    });
     try {
       const escrowFlop = options.escrowFlop ?? 5;
       const acct = await chainClient.getAccountInfo(identity.ss58Address);
@@ -786,7 +892,9 @@ export async function spendTestnetCompute(
 
   // Path 3: On-chain HTLC buyVerifiedInference when neither direct miner URL nor gateway API key is configured
   if (candidateModel) {
-    const chainClient = await FlopChainClient.createWithKeypair(config.rpcUrl, identity.pair);
+    const chainClient = await FlopChainClient.createWithKeypair(config.rpcUrl, identity.pair, {
+      expectedGenesisHash: config.network === 'testnet' ? D10_FAUCET_GENESIS_HASH : undefined,
+    });
     try {
       const maxFlop = options.escrowFlop ?? 5;
       const acct = await chainClient.getAccountInfo(identity.ss58Address);
