@@ -100,6 +100,19 @@ export interface FaucetLimitsMetadata {
   };
 }
 
+export interface FaucetHealthMetadata {
+  status?: string;
+  connected?: boolean;
+  live?: boolean;
+  ready?: boolean;
+  dependencies?: {
+    signer?: { ok?: boolean };
+    indexer?: { ok?: boolean; details?: { lagBlocks?: number } };
+    funding?: { ok?: boolean };
+    signing?: { held?: boolean; reason?: string | null };
+  };
+}
+
 export interface DerivedSubstrateIdentity {
   did: string;
   ss58Address: string;
@@ -243,6 +256,36 @@ export async function fetchFaucetLimits(
       return { ok: false, status: res.status, error: `HTTP ${res.status}` };
     }
     const data = (await res.json()) as FaucetLimitsMetadata;
+    return { ok: true, status: res.status, data };
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      status: 0,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+export async function fetchFaucetHealth(
+  faucetUrl: string
+): Promise<{ ok: boolean; status: number; data?: FaucetHealthMetadata; error?: string }> {
+  const base = faucetUrl.replace(/\/+$/, '');
+  try {
+    const res = await fetch(`${base}/health`, {
+      headers: { Accept: 'application/json', 'User-Agent': 'TechnocoreAgentBot/1.0' },
+      signal: AbortSignal.timeout(8000),
+      cache: 'no-store',
+    });
+    const text = await res.text();
+    let data: FaucetHealthMetadata | undefined;
+    try {
+      data = JSON.parse(text) as FaucetHealthMetadata;
+    } catch {
+      data = undefined;
+    }
+    if (!res.ok) {
+      return { ok: false, status: res.status, data, error: `HTTP ${res.status}` };
+    }
     return { ok: true, status: res.status, data };
   } catch (err: unknown) {
     return {
@@ -430,9 +473,10 @@ export async function probeTestnetHealth(
 
   let faucetMatchesTestnet = false;
   if (config.faucetUrl) {
-    const [chainMeta, limitsRes] = await Promise.all([
+    const [chainMeta, limitsRes, healthRes] = await Promise.all([
       fetchFaucetChainMetadata(config.faucetUrl),
       fetchFaucetLimits(config.faucetUrl),
+      fetchFaucetHealth(config.faucetUrl),
     ]);
     if (chainMeta.ok && chainMeta.data) {
       const genesisOk =
@@ -453,6 +497,19 @@ export async function probeTestnetHealth(
       }
     } else {
       console.log(`Faucet /chain     : NOT LIVE YET (${chainMeta.error ?? `HTTP ${chainMeta.status}`})`);
+    }
+    if (healthRes.ok && healthRes.data) {
+      const d = healthRes.data;
+      const signerOk = d.dependencies?.signer?.ok ? 'ok' : 'err';
+      const indexerOk = d.dependencies?.indexer?.ok ? 'ok' : 'err';
+      const lag = d.dependencies?.indexer?.details?.lagBlocks ?? 'n/a';
+      console.log(
+        `Faucet /health    : ${d.ready ? 'READY' : 'NOT READY'} (live=${String(Boolean(d.live))}, signer=${signerOk}, indexer=${indexerOk} lag=${lag})`
+      );
+    } else {
+      console.log(
+        `Faucet /health    : NOT READY (${healthRes.error ?? `HTTP ${healthRes.status}`})`
+      );
     }
     if (limitsRes.ok && limitsRes.data?.faucet) {
       const f = limitsRes.data.faucet;
@@ -527,7 +584,12 @@ export async function probeTestnetHealth(
 export async function claimDailyFaucet(
   seedHex: string,
   config: FlopTestnetEnvConfig,
-  options: { viaTechnocoreBot?: boolean; skipNetworkMatch?: boolean } = {}
+  options: {
+    viaTechnocoreBot?: boolean;
+    skipNetworkMatch?: boolean;
+    reconcileUnknown?: boolean;
+    timeoutMs?: number;
+  } = {}
 ): Promise<{
   claimed: boolean;
   outcome: string;
@@ -543,24 +605,53 @@ export async function claimDailyFaucet(
   const identity = await deriveAgentSubstrateIdentity(seedHex, config.substrateUri);
   const state = loadLocalAgentState(config.stateFilePath);
 
+  let reconcileNonce: string | undefined;
   if (state.lastFaucetAttemptAt && state.network === config.network) {
     const elapsed = Date.now() - Date.parse(state.lastFaucetAttemptAt);
-    if (Number.isFinite(elapsed) && elapsed < FAU_COOLDOWN_MS) {
-      if (state.lastFaucetOutcome === 'unknown') {
+    if (state.lastFaucetOutcome === 'unknown') {
+      if (!options.reconcileUnknown) {
         return {
           claimed: false,
           outcome: 'unknown_pending_reconcile',
-          reason: 'Prior faucet request outcome was unknown; reconcile balance instead of retrying blindly.',
+          nonce: state.lastFaucetNonce,
+          reason:
+            'Prior faucet request outcome was unknown; run with --reconcile to verify balance and repeat the same nonce safely.',
         };
       }
-      if (state.lastFaucetOutcome === 'accepted') {
-        const hrsLeft = ((FAU_COOLDOWN_MS - elapsed) / 3_600_000).toFixed(1);
-        return {
-          claimed: false,
-          outcome: 'cooldown',
-          reason: `Already claimed within 24h (${hrsLeft}h remaining before next daily faucet claim).`,
-        };
+
+      const chainClient = await FlopChainClient.createWithKeypair(config.rpcUrl, identity.pair, {
+        expectedGenesisHash: config.network === 'testnet' ? D10_FAUCET_GENESIS_HASH : undefined,
+      });
+      try {
+        const acct = await chainClient.getAccountInfo(identity.ss58Address);
+        if (acct.free > 0n) {
+          state.lastFaucetOutcome = 'accepted';
+          saveLocalAgentState(config.stateFilePath, state);
+          return {
+            claimed: true,
+            outcome: 'reconciled_onchain',
+            nonce: state.lastFaucetNonce,
+            reason: `Balance already credited on-chain (${formatFlop(acct.free)} FLOP free)`,
+          };
+        }
+      } finally {
+        await chainClient.disconnect();
       }
+
+      if (state.lastFaucetNonce) {
+        reconcileNonce = state.lastFaucetNonce;
+      }
+    } else if (
+      state.lastFaucetOutcome === 'accepted' &&
+      Number.isFinite(elapsed) &&
+      elapsed < FAU_COOLDOWN_MS
+    ) {
+      const hrsLeft = ((FAU_COOLDOWN_MS - elapsed) / 3_600_000).toFixed(1);
+      return {
+        claimed: false,
+        outcome: 'cooldown',
+        reason: `Already claimed within 24h (${hrsLeft}h remaining before next daily faucet claim).`,
+      };
     }
   }
 
@@ -696,8 +787,23 @@ export async function claimDailyFaucet(
   }
 
   if (config.network === 'testnet') {
+    if (!reconcileNonce) {
+      const healthRes = await fetchFaucetHealth(config.faucetUrl);
+      if (!healthRes.ok || !healthRes.data?.ready) {
+        const signerOk = healthRes.data?.dependencies?.signer?.ok;
+        const indexerOk = healthRes.data?.dependencies?.indexer?.ok;
+        return {
+          claimed: false,
+          outcome: 'unavailable',
+          reason: `Faucet /health not ready (${healthRes.error ?? `HTTP ${healthRes.status}`}, ready=${String(Boolean(healthRes.data?.ready))}, signer=${String(signerOk)}, indexer=${String(indexerOk)}). Aborted before signing.`,
+        };
+      }
+    }
+
     const res = await claimTestnetAgentFunds(identity.ss58Address, {
       endpoint: config.faucetUrl,
+      nonce: reconcileNonce,
+      timeout: options.timeoutMs ?? 90_000,
       sign: (message: Uint8Array) => identity.pair.sign(message),
     });
 

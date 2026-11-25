@@ -17,7 +17,7 @@ function parseArgs(argv: string[]) {
 
   const mode = flags.has('--doctor')
     ? 'doctor'
-    : flags.has('--faucet')
+    : flags.has('--faucet') || flags.has('--reconcile')
       ? 'faucet'
       : flags.has('--spend')
         ? 'spend'
@@ -27,6 +27,7 @@ function parseArgs(argv: string[]) {
     mode,
     allowDevnetProbe: flags.has('--probe-devnet'),
     viaTechnocoreBot: flags.has('--via-bot'),
+    reconcileUnknown: flags.has('--reconcile'),
     networkOverride: getValue('--network') as FlopNetwork | undefined,
     modelId: getValue('--model'),
     escrowFlop: getValue('--escrow') ? Number(getValue('--escrow')) : undefined,
@@ -54,6 +55,7 @@ async function main() {
     console.log(`[1/2] Requesting daily faucet for ${config.network}...`);
     const faucetRes = await claimDailyFaucet(seedHex, config, {
       viaTechnocoreBot: args.viaTechnocoreBot,
+      reconcileUnknown: args.reconcileUnknown,
     });
     console.log('Faucet result:', JSON.stringify(faucetRes, null, 2));
     if (args.mode === 'faucet') {

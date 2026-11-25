@@ -12,6 +12,7 @@
     "flop-harness": "tsx --env-file=.env.local scripts/flop-devnet-harness.ts",
     "flop-testnet:doctor": "tsx --env-file=.env.local scripts/flop-testnet-agent.ts --doctor",
     "flop-testnet:faucet": "tsx --env-file=.env.local scripts/flop-testnet-agent.ts --faucet",
+    "flop-testnet:reconcile": "tsx --env-file=.env.local scripts/flop-testnet-agent.ts --faucet --reconcile",
     "flop-testnet:run": "tsx --env-file=.env.local scripts/flop-testnet-agent.ts --run"
   },
   "dependencies": {
