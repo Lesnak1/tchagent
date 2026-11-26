@@ -147,6 +147,33 @@ export interface FlopscanStats {
   };
 }
 
+export interface GatewayHealthMetadata {
+  status?: string;
+  version?: string;
+  image?: { version?: string; revision?: string };
+  connected?: boolean;
+  syncing?: boolean;
+  network?: {
+    network?: string;
+    status?: string;
+    expected_genesis_hash?: string;
+    observed_genesis_hash?: string;
+  };
+  dependencies?: {
+    backing_service?: { ok?: boolean };
+    catalog?: { ok?: boolean };
+    settlement?: { ok?: boolean };
+    storage?: { ok?: boolean };
+  };
+}
+
+export interface FlopscanInferenceSpend {
+  totalSpentRaw: string;
+  settledChannels: number;
+  uniqueAgents: number;
+  topSpenders?: Array<{ agent: string; spent: string }>;
+}
+
 const FAU_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 export function getFlopNetworkConfig(networkOverride?: FlopNetwork): FlopTestnetEnvConfig {
@@ -320,6 +347,54 @@ export async function fetchFlopscanStats(
   }
 }
 
+export async function fetchFlopscanInferenceSpend(
+  explorerUrl: string
+): Promise<{ ok: boolean; status: number; data?: FlopscanInferenceSpend; error?: string }> {
+  const base = explorerUrl.replace(/\/+$/, '');
+  try {
+    const res = await fetch(`${base}/api/inference-spend?limit=5`, {
+      headers: { Accept: 'application/json', 'User-Agent': 'TechnocoreAgentBot/1.0' },
+      signal: AbortSignal.timeout(8000),
+      cache: 'no-store',
+    });
+    if (!res.ok) {
+      return { ok: false, status: res.status, error: `HTTP ${res.status}` };
+    }
+    const data = (await res.json()) as FlopscanInferenceSpend;
+    return { ok: true, status: res.status, data };
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      status: 0,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+export async function fetchGatewayHealth(
+  gatewayUrl: string
+): Promise<{ ok: boolean; status: number; data?: GatewayHealthMetadata; error?: string }> {
+  const base = gatewayUrl.replace(/\/+$/, '');
+  try {
+    const res = await fetch(`${base}/health`, {
+      headers: { Accept: 'application/json', 'User-Agent': 'TechnocoreAgentBot/1.0' },
+      signal: AbortSignal.timeout(8000),
+      cache: 'no-store',
+    });
+    if (!res.ok) {
+      return { ok: false, status: res.status, error: `HTTP ${res.status}` };
+    }
+    const data = (await res.json()) as GatewayHealthMetadata;
+    return { ok: true, status: res.status, data };
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      status: 0,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 export async function httpGetNoSecFetch(
   urlStr: string,
   timeoutMs = 20_000
@@ -454,7 +529,10 @@ export async function probeTestnetHealth(
   console.log(`Last Faucet Claim : ${state.lastFaucetAttemptAt ?? 'none'} (${state.lastFaucetOutcome ?? 'n/a'})`);
   console.log('----------------------------------------------------------------');
 
-  const scanStats = await fetchFlopscanStats(config.explorerUrl);
+  const [scanStats, spendStats] = await Promise.all([
+    fetchFlopscanStats(config.explorerUrl),
+    fetchFlopscanInferenceSpend(config.explorerUrl),
+  ]);
   if (scanStats.ok && scanStats.data) {
     const s = scanStats.data;
     const finBlock = s.finality?.finalizedBlock ?? 'n/a';
@@ -469,6 +547,13 @@ export async function probeTestnetHealth(
     );
   } else {
     console.log(`FLOPScan Chain    : UNREACHABLE (${scanStats.error ?? `HTTP ${scanStats.status}`})`);
+  }
+  if (spendStats.ok && spendStats.data) {
+    const sp = spendStats.data;
+    const spentFlop = formatFlop(BigInt(sp.totalSpentRaw || '0'));
+    console.log(
+      `FLOPScan Spend    : settledChannels=${sp.settledChannels}, uniqueAgents=${sp.uniqueAgents}, totalSpent=${spentFlop} FLOP`
+    );
   }
 
   let faucetMatchesTestnet = false;
@@ -526,8 +611,45 @@ export async function probeTestnetHealth(
     }
   }
 
-  const gwModels = config.gatewayUrl ? await getLiveFlopModels(config.gatewayUrl) : [];
-  console.log(`Gateway /v1/models: ${gwModels.length > 0 ? `ONLINE (${gwModels.length} models)` : 'NOT LIVE YET / UNREACHABLE'}`);
+  const [gwModels, gwHealth] = config.gatewayUrl
+    ? await Promise.all([
+        getLiveFlopModels(config.gatewayUrl),
+        fetchGatewayHealth(config.gatewayUrl),
+      ])
+    : [
+        [] as FlopModelInfo[],
+        { ok: false, status: 0 } as {
+          ok: boolean;
+          status: number;
+          data?: GatewayHealthMetadata;
+          error?: string;
+        },
+      ];
+
+  if (gwHealth.ok && gwHealth.data) {
+    const h = gwHealth.data;
+    const expected = h.network?.expected_genesis_hash?.toLowerCase();
+    const observed = h.network?.observed_genesis_hash?.toLowerCase();
+    const genesisStatus =
+      expected && observed
+        ? expected === observed &&
+          (config.network !== 'testnet' || observed === FLOP_TESTNET_GENESIS_HASH)
+          ? 'MATCH'
+          : 'MISMATCH'
+        : 'n/a';
+    const settleOk = h.dependencies?.settlement?.ok ? 'ok' : 'err';
+    console.log(
+      `Gateway /health   : ${h.status === 'ok' ? 'OK' : String(h.status ?? 'UNKNOWN')} (v${h.image?.version ?? h.version ?? 'n/a'}, genesis=${genesisStatus}, settlement=${settleOk})`
+    );
+  } else if (config.gatewayUrl) {
+    console.log(
+      `Gateway /health   : UNREACHABLE (${gwHealth.error ?? `HTTP ${gwHealth.status}`})`
+    );
+  }
+  const modelIds = gwModels.map((m) => m.id).join(', ');
+  console.log(
+    `Gateway /v1/models: ${gwModels.length > 0 ? `ONLINE (${gwModels.length} models: ${modelIds})` : 'NOT LIVE YET / UNREACHABLE'}`
+  );
 
   if (options.allowDevnetProbe && config.network !== 'devnet') {
     const devnet = getFlopNetworkProfile('devnet');
@@ -568,6 +690,11 @@ export async function probeTestnetHealth(
       `Readiness Summary : Testnet faucet is LIVE ([GENESIS MATCH]), unscored opening (miners=${minersCount}, agents=${agentsCount}, gatewayModels=${gwModels.length}).`
     );
     console.log('Safe for single-shot: npm run flop-testnet:faucet | Hold --spend until miners & voucher start block activate.');
+  } else if (config.network === 'testnet') {
+    console.log(
+      `Readiness Summary : Testnet Gateway & Miners LIVE (miners=${minersCount}, models=${gwModels.length}, agents=${agentsCount}).`
+    );
+    console.log('Balance ready; wait for announced scored voucher start block before full daily spend (unscored opening earns 0).');
   } else {
     console.log(
       `Readiness Summary : Network online (miners=${minersCount}, agents=${agentsCount}, models=${gwModels.length}).`
